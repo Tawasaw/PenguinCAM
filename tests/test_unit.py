@@ -391,7 +391,7 @@ class TestMultiMachineConfig(unittest.TestCase):
         cfg = TeamConfig(self.TWO_MACHINES)
 
         m1 = self._part_gcode(cfg)
-        self.assertIn('PERIMETER (NO TABS)', m1)
+        self.assertIn('PERIMETER - NO TABS', m1)
         self.assertIn('Tabs disabled', m1)
         self.assertNotIn('CONTOUR ONLY', m1)  # threshold 0 -> always fully clear
 
@@ -1090,7 +1090,13 @@ class TestUnmillableFeatures(unittest.TestCase):
 
 
 class TestGCodeFormatting(unittest.TestCase):
-    """Test that generated G-code has no nested comments or unicode characters."""
+    """Test that generated G-code has no nested comments or unicode characters.
+
+    `finalize_gcode` (gcode_hygiene.py) now scrubs these on the way out, so what these
+    tests really pin is that this generation path still routes through that gate - they
+    fail if a future assembly point joins its lines itself. The checks that catch the
+    mistake at its source live in tests/test_gcode_hygiene.py.
+    """
 
     def setUp(self):
         """Create a simple test part that exercises all major operations."""

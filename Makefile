@@ -7,7 +7,7 @@ install:
 
 test:
 	@echo "Running unit tests..."
-	@uv run python -m unittest discover -s tests --buffer
+	@PENGUINCAM_STRICT_GCODE=1 uv run python -m unittest discover -s tests -t . --buffer
 	@echo ""
 	@echo "Running system tests..."
-	@uv run python gcode_test.py --quiet
+	@PENGUINCAM_STRICT_GCODE=1 uv run python gcode_test.py --quiet
