@@ -1667,6 +1667,34 @@ class FRCPostProcessor:
     # ONLY when a coolant type is configured - so the default output runs on GRBL, Easel,
     # WinCNC, Mach, etc.
 
+    def _modal_setup_gcode(self):
+        """The modal state every program opens with, one code per line.
+
+        These six words are legal in a single block - six distinct modal groups, nothing
+        set twice - and stock GRBL accepts the combined form. Carbide Motion (Shapeoko
+        HDM) rejects it anyway with "Value set multiple times", so we emit one per line;
+        the machine state that results is identical, since none of these cause motion or
+        depend on each other, and all of them still precede the first move.
+
+        G90 is deliberately LAST. A parser that reads "G91.1" with integer truncation
+        sees G91 - incremental distance mode - which is the most plausible source of that
+        Carbide error (G90 and a truncated G91 really would set distance mode twice).
+        Ending on G90 means such a controller lands in absolute mode regardless. Losing
+        the arc-mode set is harmless by comparison: incremental IJK is the default
+        everywhere and the only mode GRBL supports.
+
+        Do NOT generalize this to "one G-word per line" - see _park_gcode, where G53 is
+        non-modal and MUST share its block with the motion it applies to.
+        """
+        return [
+            'G17  ; XY plane',
+            'G94  ; Feed per minute',
+            'G91.1  ; Arc centers incremental, IJK relative to start point',
+            'G40  ; Cutter comp cancel',
+            'G49  ; Tool length comp cancel',
+            'G90  ; Absolute positioning',
+        ]
+
     def _safe_z(self) -> float:
         """Work-coordinate (G54) safe retract height above Z=0 (sacrifice board). Uses the
         configured machine ceiling when set, but never below the material + clearance so a
@@ -1849,11 +1877,8 @@ class FRCPostProcessor:
             gcode.append("(  ** VERIFY Z-ZERO BEFORE RUNNING **)")
             gcode.append("")
 
-        # Modal G-code setup
-        gcode.append("G90 G94 G91.1 G40 G49 G17")
-
-        if not is_multilayer:
-            gcode.append("(G90=Absolute, G94=Feed/min, G91.1=Arc centers incremental - IJK relative to start point, G40=Cutter comp cancel, G49=Tool length comp cancel, G17=XY plane)")
+        # Modal G-code setup, one code per line (see _modal_setup_gcode)
+        gcode.extend(self._modal_setup_gcode())
 
         # Units
         if self.units == "inch":
@@ -1861,8 +1886,6 @@ class FRCPostProcessor:
         else:
             gcode.append("G21  ; Millimeters")
 
-        # Ensure absolute positioning mode
-        gcode.append("G90  ; Absolute positioning mode")
         gcode.append("")
 
         # Spindle on
@@ -4779,9 +4802,8 @@ class FRCPostProcessor:
         # === INITIALIZATION ===
         gcode.append('')
         gcode.append('( === INITIALIZATION === )')
-        gcode.append('G90 G94 G91.1 G40 G49 G17')
-        gcode.append('G20')
-        gcode.append('G90  ; Absolute positioning mode')
+        gcode.extend(self._modal_setup_gcode())
+        gcode.append('G20  ; Inches')
         gcode.append('')
         gcode.append('( Spindle )')
         gcode.append(f'S{self.spindle_speed} M3')
@@ -4980,9 +5002,8 @@ class FRCPostProcessor:
         # === INITIALIZATION ===
         gcode.append('')
         gcode.append('( === INITIALIZATION === )')
-        gcode.append('G90 G94 G91.1 G40 G49 G17')
-        gcode.append('G20')
-        gcode.append('G90  ; Absolute positioning mode')
+        gcode.extend(self._modal_setup_gcode())
+        gcode.append('G20  ; Inches')
         gcode.append('')
         gcode.append('( Spindle )')
         gcode.append(f'S{self.spindle_speed} M3')
