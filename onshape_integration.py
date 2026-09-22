@@ -19,11 +19,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, parse_qs
 
-from flask import session
+from flask import session, g
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
-from dxf_geometry import entities_to_closed_paths
+from dxf_geometry import entities_to_closed_paths, polygon_from_path
 from logging_config import log  # shared log() + logging setup (was duplicated per module)
 
 
@@ -43,6 +43,16 @@ def mask(secret):
     return f'****{s[-4:]}'
 
 
+class OnshapeAuthError(Exception):
+    """
+    Onshape rejected our credentials and a refresh could not rescue them.
+
+    Distinct from a generic failure so routes can answer 401 + a re-auth link
+    instead of a vague 500, and so the export fallback chain stops immediately
+    rather than replaying the same dead token against two more endpoints.
+    """
+
+
 class OnshapeClient:
     """Client for interacting with Onshape API"""
     
@@ -54,6 +64,7 @@ class OnshapeClient:
         self.access_token = None
         self.refresh_token = None
         self.token_expires = None
+        self.tokens_refreshed = False  # set when a refresh produces new tokens to persist
         # Auth mode: 'oauth' (interactive, session-driven) or 'apikey' (headless).
         self.auth_mode = 'oauth'
         self.api_access_key = None
@@ -230,8 +241,15 @@ class OnshapeClient:
             if response.status_code == 200:
                 token_data = response.json()
                 self.access_token = token_data.get('access_token')
+                # Onshape may rotate the refresh token too; keeping the old one would
+                # guarantee the next refresh fails.
+                self.refresh_token = token_data.get('refresh_token', self.refresh_token)
                 expires_in = token_data.get('expires_in', 3600)
                 self.token_expires = datetime.now() + timedelta(seconds=expires_in)
+                # Signals the request layer to write these back to the session cookie;
+                # a refresh retires the previous tokens at Onshape, so losing the new
+                # ones leaves the session holding credentials that can never work.
+                self.tokens_refreshed = True
                 return True
             else:
                 return False
@@ -248,12 +266,14 @@ class OnshapeClient:
                 raise ValueError("API-key mode selected but keys are not set")
             return
         if not self.access_token:
-            raise ValueError("No access token. User must authenticate first.")
+            raise OnshapeAuthError("Not connected to Onshape. Please connect your account.")
         
         # Refresh if expired or about to expire (within 5 minutes)
         if self.token_expires and datetime.now() >= self.token_expires - timedelta(minutes=5):
             if not self.refresh_access_token():
-                raise ValueError("Token expired and refresh failed")
+                raise OnshapeAuthError(
+                    "Onshape access expired and could not be refreshed. "
+                    "Please reconnect your Onshape account.")
     
     def _make_api_request(self, method, endpoint, **kwargs):
         """
@@ -281,7 +301,27 @@ class OnshapeClient:
             )
 
         headers['Authorization'] = f'Bearer {self.access_token}'
-        return self.session.request(method, url, headers=headers, **kwargs)
+        response = self.session.request(method, url, headers=headers, **kwargs)
+
+        # A 401 is the only authoritative signal that the token is dead. The clock
+        # check in _ensure_valid_token cannot see a token Onshape retired early (which
+        # happens when the same user re-authorizes elsewhere), so react to the 401
+        # itself: refresh once and replay. Without this the session stays broken
+        # forever, since nothing else ever reconsiders the stored token.
+        if response.status_code == 401:
+            log("Onshape returned 401; attempting token refresh and one retry")
+            if not self.refresh_access_token():
+                raise OnshapeAuthError(
+                    "Onshape access expired and could not be refreshed. "
+                    "Please reconnect your Onshape account.")
+            headers['Authorization'] = f'Bearer {self.access_token}'
+            response = self.session.request(method, url, headers=headers, **kwargs)
+            if response.status_code == 401:
+                raise OnshapeAuthError(
+                    "Onshape rejected our credentials even after refreshing. "
+                    "Please reconnect your Onshape account.")
+
+        return response
     
     def get_user_info(self):
         """Get information about the authenticated user"""
@@ -463,6 +503,8 @@ class OnshapeClient:
                 log(f"exportinternal failed: {response.status_code}")
                 log(f"Response: {response.text}")
                 
+        except OnshapeAuthError:
+            raise  # dead credentials: the other two methods would fail identically
         except Exception as e:
             log(f"Error with exportinternal: {e}")
             log(traceback.format_exc())
@@ -493,6 +535,8 @@ class OnshapeClient:
             else:
                 log(f"POST export failed: {response.status_code}")
                 
+        except OnshapeAuthError:
+            raise
         except Exception as e:
             log(f"Error with POST export: {e}")
         
@@ -535,6 +579,8 @@ class OnshapeClient:
                 log(f"Response: {response.text}")
                 return None
                 
+        except OnshapeAuthError:
+            raise
         except Exception as e:
             log(f"Error starting translation: {e}")
             log(traceback.format_exc())
@@ -561,6 +607,8 @@ class OnshapeClient:
                 log(f"Failed to check translation: {response.status_code}")
                 return None
                 
+        except OnshapeAuthError:
+            raise
         except Exception as e:
             log(f"Error checking translation: {e}")
             return None
@@ -1326,14 +1374,16 @@ class OnshapeClient:
                     log(f"      Detected concentric circles: outer r={concentric_group[0]['radius']:.3f}\", "
                         f"{len(concentric_group)-1} inner hole(s) - created ring")
 
-        # Add polylines as filled polygons
+        # Add polylines as filled polygons. Repair rather than discard: these are raw
+        # CAD boundary loops, and in this negative-space representation a lost loop is a
+        # window that never gets cut (see polygon_from_path).
         for polyline in polylines:
-            try:
-                poly = Polygon(polyline)
-                if poly.is_valid:
-                    geoms.append(poly)
-            except Exception:
-                pass
+            poly, _ = polygon_from_path(polyline)
+            if poly is None:
+                log(f"    WARNING: boundary loop with {len(polyline)} points encloses "
+                    f"no area - a feature may be missing from this part")
+                continue
+            geoms.append(poly)
 
         # Containment-aware union: if a smaller polygon is fully inside a larger one,
         # it represents a hole boundary (e.g., a circle inside a rectangle), not a
@@ -1901,12 +1951,21 @@ class OnshapeClient:
         try:
             log("\n🔍 Searching for PenguinCAM-config.yaml...")
             self.last_config_url = None
+            # Plain-language reason for the most recent failed lookup. Every `return None`
+            # below sets one. Without it a failed search is invisible to the user: the page
+            # just keeps saying "Using default configuration" with no hint of why, which is
+            # the single biggest source of "PenguinCAM won't pick up our config" reports.
+            self.last_config_error = None
 
             user_companies = self.get_companies() or []
             user_classroom_ids = {c.get('id') for c in user_companies if c.get('id')}
 
             if not user_classroom_ids:
                 log("   ❌ User belongs to no classrooms — PenguinCAM expects the config to live in a company/team-owned document")
+                self.last_config_error = (
+                    "Your Onshape account isn't a member of any classroom or company. "
+                    "PenguinCAM-config.yaml has to live in a document owned by a "
+                    "classroom/company you belong to, not in a personal document.")
                 return None
 
             log(f"   User belongs to {len(user_classroom_ids)} classroom(s)")
@@ -1951,6 +2010,10 @@ class OnshapeClient:
 
             if not candidates:
                 log("   ℹ️  No PenguinCAM-config.yaml found in your classrooms")
+                self.last_config_error = (
+                    "No document named PenguinCAM-config.yaml turned up in your "
+                    "classrooms. Check the file name, and note that Onshape's search "
+                    "index can take a few minutes to notice a brand-new file.")
                 return None
 
             # Belt-and-suspenders: re-verify each candidate's owner via document
@@ -1974,6 +2037,9 @@ class OnshapeClient:
 
             if not verified:
                 log("   ❌ No PenguinCAM-config.yaml found in your classrooms after verification")
+                self.last_config_error = (
+                    "A matching document was found, but it isn't owned by a classroom "
+                    "you belong to, so PenguinCAM ignored it.")
                 return None
 
             def sort_key(entry):
@@ -2001,10 +2067,12 @@ class OnshapeClient:
                 doc_info = self.get_document_info(doc_id)
                 if not doc_info:
                     log("   ❌ Could not get document info")
+                    self.last_config_error = "Onshape would not return information about the config document."
                     return None
                 workspace_id = doc_info.get('defaultWorkspace', {}).get('id')
                 if not workspace_id:
                     log("   ❌ No default workspace found")
+                    self.last_config_error = "The config document has no default workspace."
                     return None
 
             log(f"   ✅ Using workspace: {workspace_id[:8]}...")
@@ -2019,6 +2087,9 @@ class OnshapeClient:
             if response.status_code != 200:
                 log(f"   ❌ Could not list elements: HTTP {response.status_code}")
                 log(f"   Response: {response.text[:500]}")
+                self.last_config_error = (
+                    f"Onshape refused to list the config document's tabs (HTTP "
+                    f"{response.status_code}). You may not have permission to open it.")
                 return None
 
             elements = response.json()
@@ -2040,6 +2111,10 @@ class OnshapeClient:
             if not config_element:
                 log("   ❌ No YAML element found in document")
                 log(f"   Available elements: {[e.get('name') for e in elements]}")
+                self.last_config_error = (
+                    "The document was found, but none of its tabs is a file named "
+                    "PenguinCAM-config.yaml. Upload the YAML as a blob tab, and make "
+                    "sure the TAB (not just the document) carries that name.")
                 return None
 
             element_id = config_element.get('id')
@@ -2058,6 +2133,9 @@ class OnshapeClient:
             if response.status_code != 200:
                 log(f"   ❌ Could not download blob: HTTP {response.status_code}")
                 log(f"   Response: {response.text[:500]}")
+                self.last_config_error = (
+                    f"Found PenguinCAM-config.yaml but could not download it "
+                    f"(HTTP {response.status_code}).")
                 return None
 
             # Return raw text content
@@ -2071,6 +2149,7 @@ class OnshapeClient:
         except Exception as e:
             log(f"   ❌ EXCEPTION in fetch_config_file: {e}")
             log(f"   Full traceback:\n{traceback.format_exc()}")
+            self.last_config_error = f"The config lookup failed unexpectedly: {e}"
             return None
 
 
@@ -2184,6 +2263,15 @@ class OnshapeSessionManager:
         expires_str = tokens.get('expires_at')
         if expires_str:
             client.token_expires = datetime.fromisoformat(expires_str)
+
+        # Register for end-of-request persistence (see _persist_onshape_tokens). Saving
+        # only on success paths loses tokens whenever a request later fails, and because
+        # a refresh retires the old tokens at Onshape that leaves the session
+        # permanently unusable rather than merely unchanged.
+        try:
+            g.onshape_client = client
+        except RuntimeError:
+            pass  # no request context (CLI/test use); caller persists explicitly
 
         return client
 

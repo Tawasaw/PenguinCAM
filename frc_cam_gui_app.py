@@ -4,7 +4,7 @@ PenguinCAM - FRC Team 6238 CAM Tool
 A Flask-based web interface for generating G-code from DXF files
 """
 
-from flask import Flask, render_template, request, jsonify, send_file, session, send_from_directory, redirect, make_response
+from flask import Flask, render_template, request, jsonify, send_file, session, send_from_directory, redirect, make_response, g
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -41,7 +41,7 @@ werkzeug_logger.handlers = []  # Remove all handlers
 
 # Import Google Drive integration (optional - will work without it)
 try:
-    from google_drive_integration import GoogleDriveUploader
+    from google_drive_integration import GoogleDriveUploader, default_folder_id
     GOOGLE_DRIVE_AVAILABLE = True
 except ImportError:
     GOOGLE_DRIVE_AVAILABLE = False
@@ -58,7 +58,8 @@ except ImportError:
 
 # Import Onshape integration (optional - will work without it)
 try:
-    from onshape_integration import get_onshape_client, session_manager, build_multilayer_dxf
+    from onshape_integration import (get_onshape_client, session_manager, build_multilayer_dxf,
+                                     OnshapeAuthError)
     ONSHAPE_AVAILABLE = True
 except ImportError:
     ONSHAPE_AVAILABLE = False
@@ -409,6 +410,24 @@ def normalize_material(material):
         return 'polycarbonate'
     return material
 
+@app.after_request
+def _persist_onshape_tokens(response):
+    """
+    Write back Onshape tokens that were refreshed during this request.
+
+    Runs for error responses too, which is the point: a refresh retires the previous
+    tokens at Onshape, so a refresh that isn't saved leaves the session holding dead
+    credentials and every later request 401s until the user manually re-authorizes.
+    """
+    if ONSHAPE_AVAILABLE:
+        client = getattr(g, 'onshape_client', None)
+        if client is not None and getattr(client, 'tokens_refreshed', False):
+            session_manager.update_session_tokens(client)
+            client.tokens_refreshed = False
+            log("🔄 Onshape tokens refreshed and saved to session")
+    return response
+
+
 def get_onshape_client_or_401():
     """
     Get Onshape client for current user, or return 401 error response.
@@ -459,6 +478,7 @@ def _load_team_config_into_session(client):
         session['team_number'] = team_config.team_number
         session['team_config_url'] = getattr(client, 'last_config_url', None)
         session['using_default_config'] = False
+        session.pop('team_config_error', None)
     else:
         log("⚠️  No team config found - using defaults")
         team_config = TeamConfig()
@@ -467,6 +487,9 @@ def _load_team_config_into_session(client):
         session['team_number'] = team_config.team_number
         session.pop('team_config_url', None)
         session['using_default_config'] = True
+        # Why the lookup came up empty, in plain language, so /config/refresh can tell the
+        # user instead of silently re-rendering an identical page (see fetch_config_file).
+        session['team_config_error'] = getattr(client, 'last_config_error', None) if client else None
     session['team_config_fetched_at'] = time.time()
     # Persist any token refresh triggered by the Onshape API calls above.
     if client:
@@ -494,13 +517,18 @@ def _maybe_refresh_team_config():
         session['team_config_fetched_at'] = time.time()
 
 
-def _active_team_config():
+def _active_team_config(machine_id=None):
     """The TeamConfig that applies to the current COMPUTE request (/process, /process-job,
     /part-outline). Upload-supplied config (from the anonymous flow's POST /session/config)
     takes precedence when present; otherwise the Onshape classroom config cached in the
     session; otherwise Team 6238 defaults. Single resolver so the compute endpoints agree
     with what the page rendered. Note: only the upload flow ever sets `upload_config_data`,
-    so an Onshape user (who never hits /session/config) transparently keeps their config."""
+    so an Onshape user (who never hits /session/config) transparently keeps their config.
+
+    `machine_id` binds the returned config to the machine the job selected, so ALL of that
+    machine's settings apply (tabs, pockets, z_reference, park, coolant, bed size, ...) --
+    not just its materials. Falls back to the session's machine, then the config's default,
+    so a request that omits machine_id still matches what the page rendered."""
     # A browser tab can survive a local-server restart while its Flask session cannot. In
     # that case /process-job may be the first request to reach the new server, without a
     # fresh page render to populate upload_config_data. Resolve the local YAML here as well
@@ -508,8 +536,10 @@ def _active_team_config():
     if is_local_mode() and not session.get('upload_config_data'):
         load_local_team_config_into_session()
     if session.get('upload_config_data'):
-        return TeamConfig.from_dict(session['upload_config_data'])
-    return TeamConfig.from_dict(session.get('team_config_data', {}))
+        config = TeamConfig.from_dict(session['upload_config_data'])
+    else:
+        config = TeamConfig.from_dict(session.get('team_config_data', {}))
+    return config.for_machine(machine_id or session.get('machine_id'))
 
 
 def _app_template_context(force_defaults=False):
@@ -531,11 +561,18 @@ def _app_template_context(force_defaults=False):
         using_default = not bool(team_config_data)
     else:
         team_config_data = session.get('team_config_data', {})
-        using_default = session.get('using_default_config', False)
-    team_config = TeamConfig(team_config_data)
+        # Derive from the data rather than the stored flag: the two are always written
+        # together by _load_team_config_into_session, and deriving means a session that
+        # never completed a lookup reports "defaults" instead of claiming a real config.
+        using_default = not bool(team_config_data)
+    # Bind to the session's machine so this context reflects the same machine the compute
+    # endpoints will use. active_machine_id resolves a stale/unknown session id back to the
+    # default machine, so a config edit that renames machines can't leave the page pointing
+    # at a machine that no longer exists.
+    team_config = TeamConfig(team_config_data).for_machine(session.get('machine_id'))
 
     machines = team_config.get_available_machines()
-    current_machine_id = session.get('machine_id', team_config.default_machine_id)
+    current_machine_id = team_config.active_machine_id
 
     team_config_dict = team_config.to_dict(current_machine_id)
     drive_enabled = team_config_dict.get('google_drive_enabled', False)
@@ -591,6 +628,9 @@ def _app_template_context(force_defaults=False):
         'config_team_name': team_config.team_name,
         'config_url': (session.get('upload_config_url') if force_defaults
                        else session.get('team_config_url')),
+        # One-shot result of an explicit /config/refresh click, consumed on this render so
+        # it doesn't stick around on the next page load.
+        'config_refresh_result': None if force_defaults else session.pop('config_refresh_result', None),
         'machines': machines,
         'machines_info': machines_info,
         'current_machine_id': current_machine_id,
@@ -809,16 +849,39 @@ def index():
 
 @app.route('/config/refresh')
 def refresh_config():
-    """Force an immediate re-fetch of the team config from Onshape (the subtle reload glyph
-    next to the config link). Same fetch-and-store as login and the TTL refresh; returns
-    the user to wherever they were."""
-    if ONSHAPE_AVAILABLE:
-        client = session_manager.get_client(get_current_user_id())
-        if client:
-            try:
-                _load_team_config_into_session(client)
-            except Exception as e:
-                log(f"⚠️  Manual team config refresh failed: {e}")
+    """Force an immediate re-search for the team config in Onshape (the subtle reload glyph
+    next to the config banner). Same fetch-and-store as login and the TTL refresh.
+
+    Offered whether or not a config is currently loaded: a team that starts on defaults and
+    only later adds PenguinCAM-config.yaml needs exactly this button, and before it was
+    rendered only once a config had ALREADY been found - so the one case that needed it
+    most had no way to trigger it.
+
+    Stashes a one-shot outcome message (consumed by the next render) because the failure
+    mode is otherwise invisible: without it, a click that finds nothing returns a
+    byte-identical page and looks like a broken button."""
+    if not ONSHAPE_AVAILABLE:
+        session['config_refresh_result'] = {'ok': False, 'message': 'Onshape integration is not enabled.'}
+        return redirect(request.referrer or '/')
+    client = session_manager.get_client(get_current_user_id())
+    if not client:
+        session['config_refresh_result'] = {
+            'ok': False, 'message': 'You are not signed in to Onshape, so there is nowhere to look.'}
+        return redirect(request.referrer or '/')
+    try:
+        team_config = _load_team_config_into_session(client)
+    except Exception as e:
+        log(f"⚠️  Manual team config refresh failed: {e}")
+        session['config_refresh_result'] = {
+            'ok': False, 'message': f'The lookup failed: {e}'}
+        return redirect(request.referrer or '/')
+    if session.get('using_default_config'):
+        reason = session.get('team_config_error') or 'No PenguinCAM-config.yaml was found.'
+        session['config_refresh_result'] = {'ok': False, 'message': f'Still using defaults. {reason}'}
+    else:
+        session['config_refresh_result'] = {
+            'ok': True,
+            'message': f'Loaded config for {team_config.team_number} ({team_config.team_name}).'}
     return redirect(request.referrer or '/')
 
 
@@ -1000,8 +1063,8 @@ def process_file():
         log(f"🚀 Running post-processor API...")
 
         # Get the team config that applies to this request (upload-supplied, Onshape, or
-        # defaults). Single resolver so /process matches what the page rendered.
-        team_config = _active_team_config()
+        # defaults), bound to the selected machine so its full settings apply.
+        team_config = _active_team_config(machine_id)
         log(f"📋 Using team config: {team_config}")
         log(f"🔍 DEBUG: TeamConfig internals: team={team_config.team_number}, name={team_config.team_name}")
 
@@ -1149,6 +1212,10 @@ def process_file():
             'filename': output_token,  # Return secure token (not actual filename)
             'gcode': result.gcode,
             'console': console_output,
+            # Settings PenguinCAM adapted to suit this part (e.g. a team-config tab height
+            # taller than the stock being cut). Not failures - the operator just needs to
+            # know what changed, since they usually cannot edit the team config themselves.
+            'warnings': result.warnings,
             'parameters': parameters
         }
 
@@ -1240,7 +1307,7 @@ def process_job():
             f.save(p)
             saved_paths[idx] = p
 
-        team_config = _active_team_config()
+        team_config = _active_team_config(machine_id)
         user_name = session.get('user_name')
         machine_x = team_config.machine_x_max
         machine_y = team_config.machine_y_max
@@ -1251,6 +1318,7 @@ def process_job():
         prepared = []
         placed = []
         gen_errors = []
+        job_warnings = []  # per-part settings adapted to fit; surfaced, never fatal
         for i, part in enumerate(parts_spec):
             fidx = part.get('file_index', i)
             if fidx not in saved_paths:
@@ -1313,6 +1381,8 @@ def process_job():
                 'interior': phases['interior'], 'perimeter': phases['perimeter'],
                 'tab_removal': phases['tab_removal'],
             })
+            for note in getattr(item['pp'], 'warnings', []):
+                job_warnings.append(f"{item['name']}: {note}")
             minx, miny, maxx, maxy = item['bbox']
             response_parts.append({
                 'index': i, 'name': item['name'],
@@ -1350,6 +1420,7 @@ def process_job():
             'cycle_time_seconds': result.stats.get('cycle_time_seconds'),
             'stock': {'width': round(stock_w, 4), 'height': round(stock_h, 4)},
             'parts': response_parts,
+            'warnings': job_warnings,
         })
 
     except ValueError as e:
@@ -1556,7 +1627,9 @@ def drive_status():
     # Check team config to see if Drive is enabled
     team_config = session.get('team_config', {})
     drive_enabled = team_config.get('google_drive_enabled', False)
-    folder_id = team_config.get('google_drive_folder_id')
+    # Same resolution order the upload path uses, so status can never report "ready"
+    # for a destination the upload would then fail to find.
+    folder_id = team_config.get('google_drive_folder_id') or default_folder_id()
 
     if not drive_enabled or not folder_id:
         return jsonify({
@@ -1642,9 +1715,12 @@ def upload_to_drive(token):
                 }), 401
             log(f"✅ Got credentials, scopes: {creds.scopes if hasattr(creds, 'scopes') else 'unknown'}")
         
-        # Create uploader with credentials
-        log("🔧 Creating GoogleDriveUploader...")
-        uploader = GoogleDriveUploader(credentials=creds)
+        # Create uploader with credentials and THIS team's destination folder.
+        # The folder is per-team session state, so it must be passed per request --
+        # the server process is shared by every team.
+        folder_id = session.get('team_config', {}).get('google_drive_folder_id') or default_folder_id()
+        log(f"🔧 Creating GoogleDriveUploader (folder {folder_id})...")
+        uploader = GoogleDriveUploader(credentials=creds, folder_id=folder_id)
         
         log("🔐 Authenticating...")
         if not uploader.authenticate():
@@ -1913,7 +1989,9 @@ def onshape_export_face():
                     log(f"[EXPORT] 2D thickness discovery failed (non-fatal): {e}")
         session_manager.update_session_tokens(client)
         if not dxf_bytes:
-            return jsonify({'error': 'Onshape returned no DXF for that face.'}), 502
+            # NOT 502: Cloudflare replaces any origin 502/504 body with its own error
+            # page, so a gateway status here reaches the user as opaque HTML.
+            return jsonify({'error': 'Onshape returned no DXF for that face.'}), 500
 
         tmp = tempfile.NamedTemporaryFile(suffix='.dxf', delete=False, dir=UPLOAD_FOLDER)
         path = tmp.name
@@ -1968,11 +2046,16 @@ def onshape_export_face():
         detail = ' (2.5D, t={:.4f}")'.format(detected_thickness) if detected_thickness else ''
         log(f"[EXPORT] ok name='{geo['name']}' {geo['width']}x{geo['height']}{detail}")
         return jsonify(geo)
+    except OnshapeAuthError as e:
+        # Credentials are dead and a refresh could not rescue them. 401 + auth_url lets
+        # the panel offer a reconnect link instead of showing a dead-end error.
+        log(f"[EXPORT] Onshape auth failed: {e}")
+        return jsonify({'error': str(e), 'auth_url': '/onshape/auth'}), 401
     except RuntimeError as e:
         # Expected, user-facing failures from the 2.5D builder (bad face selection,
-        # expired auth, no parallel faces).
+        # no parallel faces). 400, not 502 -- see the note above about Cloudflare.
         log(f"[EXPORT] multilayer failed: {e}")
-        return jsonify({'error': str(e)}), 502
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         log(traceback.format_exc())
         return jsonify({'error': f'Face export failed: {str(e)}'}), 500
@@ -2042,7 +2125,8 @@ def feeds_speeds_presets():
         'machines': feeds_speeds.MACHINES,
         'materials': feeds_speeds.MATERIALS,
         'tools': feeds_speeds.TOOL_PRESETS,
-        'reference_tool': feeds_speeds.REFERENCE_TOOL,
+        'operations': feeds_speeds.OPERATIONS,
+        'iso_groups': feeds_speeds.ISO_GROUP_NAMES,
     })
 
 @app.route('/api/feeds-speeds', methods=['POST'])
@@ -2050,17 +2134,21 @@ def feeds_speeds_presets():
 def api_feeds_speeds():
     """Compute derived feeds & speeds from machine + material + tool inputs.
 
-    Body: {machine, material, tool: {diameter, flutes}, operation}. The machine and
-    material may each be a preset key or an inline dict of overrides (see
-    feeds_speeds._resolve), so the public calculator works without PenguinCAM presets.
+    Body: {machine, material, tool, operation, ae_override, ap_override,
+    bore_diameter}. Each of machine/material/tool may be a preset key or an inline
+    dict of overrides (see feeds_speeds._resolve), so the public calculator works
+    without PenguinCAM presets.
     """
     data = request.get_json(silent=True) or {}
     try:
         result = feeds_speeds.calculate_feeds(
-            data.get('machine', 'omio_x8'),
-            data.get('material', 'plywood'),
-            data.get('tool') or feeds_speeds.TOOL_PRESETS['4mm_1f'],
-            operation=data.get('operation', 'profile'),
+            data.get('machine') or 'avid_pro2424',
+            data.get('material') or 'plywood',
+            data.get('tool') or '4mm_1f',
+            operation=data.get('operation') or 'profile',
+            ae_override=data.get('ae_override'),
+            ap_override=data.get('ap_override'),
+            bore_diameter=data.get('bore_diameter'),
         )
     except (ValueError, TypeError, KeyError) as exc:
         return jsonify({'error': str(exc)}), 400
@@ -2075,7 +2163,10 @@ def set_machine():
         if not machine_id:
             return jsonify({'error': 'No machine_id provided'}), 400
 
-        # Verify machine exists in config
+        # Verify machine exists in config. Uses the same resolver as the compute endpoints
+        # so the anonymous upload flow (whose config lives in `upload_config_data`) can
+        # switch machines too -- reading only `team_config_data` here rejected every machine
+        # in that flow, and the client fire-and-forgets this call, so the 400 was silent.
         team_config = _active_team_config()
         machines = team_config.get_available_machines()
 

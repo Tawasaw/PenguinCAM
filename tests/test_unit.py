@@ -5,11 +5,13 @@ Focus on higher-level functions; minimal tests for low-level utilities.
 
 import unittest
 import math
+import re
 import sys
 import os
 import tempfile
 
 import ezdxf
+from shapely.geometry import Polygon
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,6 +26,7 @@ from onshape_integration import OnshapeClient
 from gcode_sim import parse_header_metadata
 from shapely.geometry import Point
 from shapely.ops import unary_union
+from dxf_geometry import entities_to_closed_paths, polygon_from_path
 
 
 class TestGcodeCommentCompatibility(unittest.TestCase):
@@ -241,7 +244,6 @@ class TestSharedDxfStitcher(unittest.TestCase):
         return ezdxf.new().modelspace()
 
     def test_lines_and_ellipse_arc_close(self):
-        from dxf_geometry import entities_to_closed_paths
         msp = self._msp()
         msp.add_line((0, 0), (10, 0)); msp.add_line((10, 0), (10, 5)); msp.add_line((0, 5), (0, 0))
         msp.add_ellipse(center=(5, 5), major_axis=(5, 0), ratio=0.4, start_param=0, end_param=math.pi)
@@ -252,14 +254,12 @@ class TestSharedDxfStitcher(unittest.TestCase):
         self.assertGreater(len(paths[0]), 4)
 
     def test_full_ellipse_is_a_closed_path(self):
-        from dxf_geometry import entities_to_closed_paths
         msp = self._msp()
         msp.add_ellipse(center=(0, 0), major_axis=(4, 0), ratio=0.5, start_param=0, end_param=2 * math.pi)
         paths = entities_to_closed_paths(ellipses=list(msp.query('ELLIPSE')))
         self.assertEqual(len(paths), 1)
 
     def test_open_loop_reported_not_dropped_silently(self):
-        from dxf_geometry import entities_to_closed_paths
         msp = self._msp()
         # 3 sides of a square (missing the 4th) -> an open chain, not a closed path.
         msp.add_line((0, 0), (10, 0)); msp.add_line((10, 0), (10, 10)); msp.add_line((10, 10), (0, 10))
@@ -269,6 +269,46 @@ class TestSharedDxfStitcher(unittest.TestCase):
         self.assertEqual(paths, [])
         self.assertEqual(len(seen), 1)
         self.assertAlmostEqual(seen[0], 10.0, places=3)   # end-to-end gap of the open chain
+
+    def test_half_grid_vertex_does_not_split_a_ring(self):
+        """A shared vertex sitting exactly on a snap-grid HALF step used to snap UP from
+        one entity and DOWN from the neighbour that meets it (float noise decides which),
+        splitting the junction by a full grid step. The ring then closed only within
+        tolerance, so Polygon() sealed it with a hair-length segment doubling back along
+        the first edge - a zero-area spike that makes the polygon invalid. Every consumer
+        tests is_valid, so the whole feature vanished from the part with no error.
+        (Real case: a 7.5 x 3.25 rounded-rect cutout tangent at y=9.6875 went missing.)"""
+        msp = self._msp()
+        # y = 0.6875 is exactly 687.5 snap steps; the two spellings below are the same
+        # CAD vertex as an exporter emits it into two different entities.
+        exact, noisy = 0.6875, 0.687499999999998
+        msp.add_line((0, 0), (1, 0))
+        msp.add_line((1, 0), (1, exact))
+        msp.add_line((1, noisy), (0, noisy))
+        msp.add_line((0, exact), (0, 0))
+        paths = entities_to_closed_paths(lines=list(msp.query('LINE')))
+        self.assertEqual(len(paths), 1)
+        poly = Polygon(paths[0])
+        self.assertTrue(poly.is_valid, 'half-grid vertex split the ring into a spike')
+        # Snapping quantizes 0.6875 to the 0.001" grid, so allow one grid step of slack.
+        self.assertAlmostEqual(poly.area, 0.6875, delta=0.001)
+
+    def test_polygon_from_path_repairs_a_spiked_ring(self):
+        """Defence in depth for the same failure: a ring whose closing point doubles back
+        must be repaired, never silently discarded - a dropped ring is a missing cutout."""
+        # The closing point lands ON the first edge, so sealing the ring retraces it.
+        spiked = [(0, 0), (0, 1), (1, 1), (1, 0), (0, 0.001)]
+        self.assertFalse(Polygon(spiked).is_valid)
+        poly, coords = polygon_from_path(spiked)
+        self.assertIsNotNone(poly)
+        self.assertTrue(poly.is_valid)
+        self.assertAlmostEqual(poly.area, 1.0, delta=0.002)   # spike carries no area
+        self.assertGreaterEqual(len(coords), 3)
+
+    def test_polygon_from_path_rejects_zero_area_path(self):
+        poly, coords = polygon_from_path([(0, 0), (1, 1), (2, 2)])  # collinear, no area
+        self.assertIsNone(poly)
+        self.assertIsNone(coords)
 
 
 class TestEllipsePerimeterStitching(unittest.TestCase):
@@ -374,6 +414,98 @@ class TestLengthParsing(unittest.TestCase):
         d = TeamConfig().to_dict()
         self.assertAlmostEqual(d['default_tool_diameter'], DEFAULT_TOOL_DIAMETER_IN)
         self.assertEqual(d['default_tool_diameter_text'], '4mm')
+
+
+class TestMultiMachineConfig(unittest.TestCase):
+    """A v2 config's SELECTED machine must drive every setting, not just its materials.
+
+    Regression: TeamConfig._get() used to hardcode the default machine, so a team with two
+    machines got machine 1's tabs/pockets/z_reference/park settings no matter which machine
+    they picked - only feeds/speeds followed the selection."""
+
+    # m1: no tabs, never contour interior cutouts. m2: tabs, contour above the threshold.
+    TWO_MACHINES = {
+        'version': 2,
+        'default_machine': 'm1',
+        'machines': {
+            'm1': {
+                'name': 'Router One',
+                'machine': {'name': 'Router One', 'dimensions': {'x_max': 24.0, 'y_max': 24.0}},
+                'machining': {'tabs': {'enabled': False, 'remove_tabs': False},
+                              'pockets': {'contour_threshold': 0}},
+            },
+            'm2': {
+                'name': 'Router Two',
+                'machine': {'name': 'Router Two', 'dimensions': {'x_max': 48.0, 'y_max': 96.0}},
+                'machining': {'tabs': {'enabled': True, 'remove_tabs': True},
+                              'pockets': {'contour_threshold': 510}},
+            },
+        },
+    }
+
+    def _part_gcode(self, config):
+        """6x6 plate with a 3" through-hole, cut with a 1/8" tool: big enough to land above
+        m2's contour threshold, so the two machines take visibly different strategies."""
+        pp = FRCPostProcessor(0.25, 0.125, config=config)
+        pp.apply_material_preset('plywood')
+        pp.circles = [{'center': (3.0, 3.0), 'diameter': 3.0}]
+        pp.polylines = [[(0, 0), (6, 0), (6, 6), (0, 6), (0, 0)]]
+        pp.identify_perimeter_and_pockets()
+        pp.classify_holes()
+        result = pp.generate_gcode()
+        self.assertTrue(result.success, f"G-code generation failed: {result.errors}")
+        return result.gcode
+
+    def test_unbound_config_uses_default_machine(self):
+        cfg = TeamConfig(self.TWO_MACHINES)
+        self.assertEqual(cfg.active_machine_id, 'm1')
+        self.assertFalse(cfg.tabs_enabled)
+        self.assertEqual(cfg.machine_name, 'Router One')
+
+    def test_settings_follow_the_selected_machine(self):
+        cfg = TeamConfig(self.TWO_MACHINES).for_machine('m2')
+        self.assertEqual(cfg.active_machine_id, 'm2')
+        self.assertTrue(cfg.tabs_enabled)
+        self.assertTrue(cfg.remove_tabs)
+        self.assertEqual(cfg._get('machining', 'pockets', 'contour_threshold'), 510)
+        self.assertEqual(cfg.machine_name, 'Router Two')
+        self.assertEqual(cfg.machine_x_max, 48.0)
+
+    def test_binding_does_not_mutate_the_original(self):
+        cfg = TeamConfig(self.TWO_MACHINES)
+        bound = cfg.for_machine('m2')
+        self.assertTrue(bound.tabs_enabled)
+        self.assertFalse(cfg.tabs_enabled, "binding must not affect the shared instance")
+        self.assertIs(cfg.for_machine(None), cfg)
+
+    def test_unknown_machine_falls_back_to_default(self):
+        cfg = TeamConfig(self.TWO_MACHINES).for_machine('nope')
+        self.assertEqual(cfg.active_machine_id, 'm1')
+        self.assertFalse(cfg.tabs_enabled)
+
+    def test_missing_or_dangling_default_machine_uses_first_machine(self):
+        # Without this fallback the id resolves to a nonexistent key and EVERY setting
+        # silently reverts to the built-in Team 6238 defaults.
+        for bad in ({}, {'default_machine': 'ghost'}):
+            data = {'version': 2, 'machines': self.TWO_MACHINES['machines'], **bad}
+            cfg = TeamConfig(data)
+            self.assertEqual(cfg.default_machine_id, 'm1')
+            self.assertEqual(cfg.machine_name, 'Router One')
+
+    def test_selected_machine_drives_tabs_and_contouring_in_gcode(self):
+        """End-to-end: the same part on both machines must produce different G-code."""
+        cfg = TeamConfig(self.TWO_MACHINES)
+
+        m1 = self._part_gcode(cfg)
+        self.assertIn('PERIMETER - NO TABS', m1)
+        self.assertIn('Tabs disabled', m1)
+        self.assertNotIn('CONTOUR ONLY', m1)  # threshold 0 -> always fully clear
+
+        m2 = self._part_gcode(cfg.for_machine('m2'))
+        self.assertIn('PERIMETER WITH TABS', m2)
+        self.assertIn('CONTOUR ONLY', m2)     # 3" hole exceeds the threshold
+        self.assertIn('TAB REMOVAL PASS', m2)
+        self.assertIn('Machine: Router Two', m2)
 
 
 class TestLowLevelUtilities(unittest.TestCase):
@@ -1165,8 +1297,93 @@ class TestUnmillableFeatures(unittest.TestCase):
         # else: buffer succeeded (Shapely is very robust) - test passes anyway
 
 
+class TestModalSetupLine(unittest.TestCase):
+    """The opening modal block is split one-code-per-line for Carbide Motion.
+
+    Carbide Motion (Shapeoko HDM) rejects the combined "G90 G94 G91.1 G40 G49 G17" with
+    "Value set multiple times" even though it is legal - six distinct modal groups, which
+    stock GRBL accepts. Splitting it is what makes that controller run our output.
+    """
+
+    MODAL_CODES = ['G17', 'G94', 'G91.1', 'G40', 'G49', 'G90']
+
+    def _header(self):
+        pp = FRCPostProcessor(0.25, 0.157)
+        pp.apply_material_preset('plywood')
+        pp.circles = [{'center': (1.0, 1.0), 'diameter': 0.25}]
+        pp.polylines = [[(0, 0), (4, 0), (4, 4), (0, 4)]]
+        pp.classify_holes()
+        pp.identify_perimeter_and_pockets()
+        result = pp.generate_gcode()
+        self.assertTrue(result.success)
+        return result.gcode
+
+    def test_each_modal_code_is_alone_on_its_line(self):
+        """One G-word per block, each carrying a short comment."""
+        lines = FRCPostProcessor(0.25, 0.157)._modal_setup_gcode()
+        self.assertEqual(len(self.MODAL_CODES), len(lines))
+        for code, line in zip(self.MODAL_CODES, lines):
+            body, _, comment = line.partition(';')
+            self.assertEqual(code, body.strip())
+            self.assertTrue(comment.strip(), f'{code} should carry a short comment')
+
+    def test_no_block_combines_modal_words(self):
+        """The whole point: no emitted block carries more than one G-word."""
+        gword = re.compile(r'(?<![A-Za-z0-9.])G\d+(?:\.\d+)?')
+        for line in self._header().split('\n'):
+            code = line.split(';')[0].split('(')[0]
+            self.assertLessEqual(
+                len(gword.findall(code)), 1,
+                f'Carbide Motion rejects multi-G-word blocks: {line.strip()}'
+            )
+
+    def test_absolute_mode_is_set_last(self):
+        """G90 must follow G91.1.
+
+        A parser that truncates "G91.1" to G91 would otherwise leave the machine in
+        INCREMENTAL distance mode and cut the whole part as relative moves. Ending on G90
+        makes that failure benign instead of catastrophic.
+        """
+        codes = [ln.split(';')[0].strip()
+                 for ln in FRCPostProcessor(0.25, 0.157)._modal_setup_gcode()]
+        self.assertLess(codes.index('G91.1'), codes.index('G90'))
+
+    def test_modal_setup_precedes_all_motion(self):
+        gcode = self._header().split('\n')
+        # UCCNC output uses parenthesized comments; upstream/default output may
+        # still use semicolon comments. Compare executable words in either form.
+        codes = [ln.split(';')[0].split('(')[0].strip() for ln in gcode]
+        last_modal = max(codes.index(c) for c in self.MODAL_CODES)
+        first_motion = next(i for i, c in enumerate(codes)
+                            if c.startswith(('G0 ', 'G1 ', 'G2 ', 'G3 ')))
+        self.assertLess(last_modal, first_motion)
+
+    def test_park_line_keeps_g53_with_its_motion(self):
+        """G53 is non-modal and applies only to its own block - it must NOT be split."""
+        pp = FRCPostProcessor(0.25, 0.157)
+        pp.apply_material_preset('plywood')
+        pp.park_position = (0.0, 0.0, -0.25)
+        park = pp._park_gcode('Park')
+        self.assertTrue(park, 'park_position set should emit park lines')
+        for line in park:
+            self.assertRegex(line.split(';')[0], r'G53\s+G0\s')
+
+    def test_park_emits_nothing_when_unconfigured(self):
+        """Machines without park_position never see a G53 line at all."""
+        pp = FRCPostProcessor(0.25, 0.157)
+        pp.apply_material_preset('plywood')
+        pp.park_position = None
+        self.assertEqual([], pp._park_gcode('Park'))
+
+
 class TestGCodeFormatting(unittest.TestCase):
-    """Test that generated G-code has no nested comments or unicode characters."""
+    """Test that generated G-code has no nested comments or unicode characters.
+
+    `finalize_gcode` (gcode_hygiene.py) now scrubs these on the way out, so what these
+    tests really pin is that this generation path still routes through that gate - they
+    fail if a future assembly point joins its lines itself. The checks that catch the
+    mistake at its source live in tests/test_gcode_hygiene.py.
+    """
 
     def setUp(self):
         """Create a simple test part that exercises all major operations."""
@@ -2579,9 +2796,14 @@ class TestSimplePartFundamentals(unittest.TestCase):
         self.assertLessEqual(max(zs), pp.retract_height + 1e-6,
                              "No Z move should exceed the retract/safe height")
 
-    def test_perimeter_tabs_left_at_tab_height(self):
-        """With tabs enabled, the perimeter cut lifts to cut_depth + tab_height to
-        leave holding tabs."""
+    def test_perimeter_tabs_leave_exactly_tab_height_of_material(self):
+        """`tab_height` is the material LEFT under the tab, measured from the stock bottom
+        at Z=0 (the sacrifice board) - see docs/Z_COORDINATE_SYSTEM.md.
+
+        This used to lift to `cut_depth + tab_height`, but cut_depth is BELOW the stock
+        (it overcuts into the sacrifice board), so every tab came out thinner than
+        configured by exactly that overcut - a 0.150" tab with a 0.008" overcut held the
+        part by 0.142" of material, and with a deeper overcut the shortfall grew."""
         pp = self._square_pp(thickness=0.25)
         pp.tabs_enabled = True
         pp.transform_coordinates('bottom-left', 0)
@@ -2590,11 +2812,14 @@ class TestSimplePartFundamentals(unittest.TestCase):
         result = pp.generate_gcode()
         self.assertTrue(result.success, f"Generation should succeed: {result.errors}")
 
-        expected_tab_z = pp.cut_depth + pp.tab_height
         zs = self._z_values(result.gcode)
         self.assertTrue(
-            any(abs(z - expected_tab_z) < 1e-3 for z in zs),
-            f"Expected a tab-height Z near {expected_tab_z:.4f} in the perimeter cut")
+            any(abs(z - pp.tab_height) < 1e-3 for z in zs),
+            f"Expected a tab Z near {pp.tab_height:.4f} leaving that much material")
+        self.assertLess(pp.cut_depth, 0.0, "cut_depth should overcut below the stock")
+        self.assertFalse(
+            any(abs(z - (pp.cut_depth + pp.tab_height)) < 1e-3 for z in zs),
+            "Tab Z should not be referenced to cut_depth - that under-delivers the tab")
 
     def test_origin_corner_translation(self):
         """Selecting the bottom-right corner maps that corner to (0,0): all X<=0, Y>=0."""

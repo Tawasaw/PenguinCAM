@@ -234,6 +234,30 @@ TEAM_6238_DEFAULTS = {
 }
 
 
+def extract_drive_folder_id(folder_value: Optional[str]) -> Optional[str]:
+    """
+    Normalize a configured Google Drive folder value to a bare folder ID.
+
+    Teams are told to paste the folder's Drive URL, but the upload path needs the
+    bare ID (it is used directly as a `parents` entry). Both the
+    TeamConfig.google_drive_folder_id property and to_dict() go through here so the
+    session dict can never carry an un-normalized URL.
+    """
+    if not folder_value:
+        return None
+
+    # Format: https://drive.google.com/drive/folders/FOLDER_ID
+    # or:     https://drive.google.com/drive/u/0/folders/FOLDER_ID
+    if 'drive.google.com' in folder_value:
+        parts = folder_value.split('/folders/')
+        if len(parts) == 2:
+            # Remove any query parameters or trailing slashes
+            return parts[1].split('?')[0].rstrip('/')
+
+    # Otherwise assume it's already just the ID
+    return folder_value
+
+
 class TeamConfig:
     """
     Manages team-specific configuration for PenguinCAM.
@@ -243,12 +267,16 @@ class TeamConfig:
     missing values.
     """
 
-    def __init__(self, config_data: Optional[Dict[str, Any]] = None):
+    def __init__(self, config_data: Optional[Dict[str, Any]] = None,
+                 machine_id: Optional[str] = None):
         """
         Initialize team config from YAML data.
 
         Args:
             config_data: Parsed YAML config dict, or None for defaults
+            machine_id: Machine this config reads from; None means the config's default
+                machine. See for_machine() - callers that know which machine a job is for
+                should bind rather than pass machine_id to individual accessors.
         """
         if config_data is None:
             config_data = {}
@@ -259,6 +287,13 @@ class TeamConfig:
         # see plain numbers.
         self._data = copy.deepcopy(self._normalize_to_v2(config_data))
         _normalize_lengths(self._data)
+
+        # Every setting resolves through _get() -> get_machine_config(), so this one field
+        # is what makes a multi-machine (v2) config actually apply the SELECTED machine's
+        # settings. Before it existed, _get() hardcoded the default machine and only
+        # materials honored the selection, so a second machine's tabs/pockets/z_reference/
+        # park/coolant blocks were silently ignored.
+        self._active_machine_id = machine_id
 
     def _normalize_to_v2(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -309,7 +344,8 @@ class TeamConfig:
         """
         Safely get nested dict value with fallback to Team 6238 defaults.
 
-        For v2 configs, checks root level first (for 'team'), then machine config.
+        For v2 configs, checks root level first (for 'team'), then the ACTIVE machine's
+        config (see for_machine; the default machine when nothing is bound).
 
         Args:
             *keys: Path to nested value (e.g., 'machine', 'park_position', 'x')
@@ -333,8 +369,8 @@ class TeamConfig:
             if value is not None:
                 return value
 
-        # Get the default machine config (handles both v1 wrapped and v2 native)
-        machine_config = self.get_machine_config(None)
+        # Get the active machine's config (handles both v1 wrapped and v2 native)
+        machine_config = self.get_machine_config()
 
         # Try to get from machine config
         value = machine_config
@@ -380,21 +416,57 @@ class TeamConfig:
 
     @property
     def default_machine_id(self) -> str:
-        """Get default machine ID"""
-        return self._data.get('default_machine', 'default')
+        """Get default machine ID.
+
+        A v2 config whose `default_machine` is missing or names a machine that isn't
+        defined falls back to the FIRST machine in the file. Without that fallback the id
+        resolves to a nonexistent key and every setting silently reverts to the built-in
+        Team 6238 defaults, which looks like "my config is being ignored"."""
+        machines = self._data.get('machines', {})
+        declared = self._data.get('default_machine')
+        if declared in machines:
+            return declared
+        if machines:
+            return next(iter(machines))
+        return declared or 'default'
+
+    @property
+    def active_machine_id(self) -> str:
+        """Machine this config currently reads from: the bound machine (see for_machine),
+        or the default machine when nothing is bound or the bound id is unknown."""
+        machine_id = self._active_machine_id
+        if machine_id is not None and machine_id in self._data.get('machines', {}):
+            return machine_id
+        return self.default_machine_id
+
+    def for_machine(self, machine_id: Optional[str]) -> 'TeamConfig':
+        """Return this config bound to `machine_id`, so every setting - not just materials
+        - comes from that machine.
+
+        Returns self when `machine_id` is None or already active. Otherwise a shallow copy
+        that SHARES the normalized (read-only) config data, so binding per request is cheap
+        and can never mutate an instance held elsewhere (e.g. one built from the session).
+        An unknown id falls back to the default machine, matching get_machine_config.
+        """
+        if machine_id is None or machine_id == self._active_machine_id:
+            return self
+        bound = copy.copy(self)
+        bound._active_machine_id = machine_id
+        return bound
 
     def get_machine_config(self, machine_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Get config for a specific machine.
 
         Args:
-            machine_id: Machine ID, or None for default machine
+            machine_id: Machine ID, or None for the active machine (the bound machine if
+                for_machine() was used, else the default machine)
 
         Returns:
             Machine configuration dict
         """
         if machine_id is None:
-            machine_id = self.default_machine_id
+            machine_id = self._active_machine_id or self.default_machine_id
 
         machines = self._data.get('machines', {})
         return machines.get(machine_id, machines.get(self.default_machine_id, {}))
@@ -623,7 +695,7 @@ class TeamConfig:
         Get all available materials for a specific machine.
 
         Args:
-            machine_id: Machine ID, or None for default machine
+            machine_id: Machine ID, or None for the active machine (see for_machine)
 
         Returns:
             Dictionary mapping material ID to material info (with 'name' and other params)
@@ -647,7 +719,7 @@ class TeamConfig:
 
         Args:
             material: Material name
-            machine_id: Machine ID, or None for default machine
+            machine_id: Machine ID, or None for the active machine (see for_machine)
 
         Returns:
             True if material has all required params, False if using fallback
@@ -675,7 +747,7 @@ class TeamConfig:
 
         Args:
             material: Material name ('plywood', 'aluminum', 'polycarbonate', or custom)
-            machine_id: Machine ID, or None for default machine
+            machine_id: Machine ID, or None for the active machine (see for_machine)
 
         Returns:
             Dictionary of material parameters (always complete, uses plywood fallback)
@@ -713,23 +785,7 @@ class TeamConfig:
         Google Drive folder ID for uploading G-code.
         Accepts either a folder ID or a full Drive URL, returns just the ID.
         """
-        folder_value = self._get('integrations', 'google_drive', 'folder_id')
-
-        if not folder_value:
-            return None
-
-        # If it's a full URL, extract the ID
-        if 'drive.google.com' in folder_value:
-            # Format: https://drive.google.com/drive/folders/FOLDER_ID
-            # or: https://drive.google.com/drive/u/0/folders/FOLDER_ID
-            parts = folder_value.split('/folders/')
-            if len(parts) == 2:
-                # Remove any query parameters or trailing slashes
-                folder_id = parts[1].split('?')[0].rstrip('/')
-                return folder_id
-
-        # Otherwise assume it's already just the ID
-        return folder_value
+        return extract_drive_folder_id(self._get('integrations', 'google_drive', 'folder_id'))
 
     # ========================================================================
     # Helpers
@@ -740,7 +796,7 @@ class TeamConfig:
         Return config as a dictionary for JSON serialization.
 
         Args:
-            machine_id: Machine ID, or None for default machine
+            machine_id: Machine ID, or None for the active machine (see for_machine)
 
         Returns:
             Dictionary with machine-specific settings
@@ -785,7 +841,8 @@ class TeamConfig:
             'machine_y_max': get_machine_setting('machine', 'dimensions', 'y_max'),
             'machine_z_max': get_machine_setting('machine', 'dimensions', 'z_max'),
             'google_drive_enabled': get_machine_setting('integrations', 'google_drive', 'enabled'),
-            'google_drive_folder_id': get_machine_setting('integrations', 'google_drive', 'folder_id'),
+            'google_drive_folder_id': extract_drive_folder_id(
+                get_machine_setting('integrations', 'google_drive', 'folder_id')),
             'default_tool_diameter': tool_in if (tool_in and tool_in > 0) else DEFAULT_TOOL_DIAMETER_IN,
             'default_tool_diameter_text': raw_tool if isinstance(raw_tool, str) else f'{raw_tool}"',
         }
@@ -823,7 +880,10 @@ class TeamConfig:
         return cls(config_dict)
 
     def __repr__(self):
-        return f"TeamConfig(team={self.team_number}, name='{self.team_name}')"
+        # Machine id included so the request logs show WHICH machine's settings a job
+        # actually ran with (the multi-machine failure mode is invisible otherwise).
+        return (f"TeamConfig(team={self.team_number}, name='{self.team_name}', "
+                f"machine='{self.active_machine_id}')")
 
 
 # =============================================================================
