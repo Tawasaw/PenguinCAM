@@ -21,8 +21,9 @@
     source: CFG.source,
     step: 'setup',
     mode: '2d',
-    machine_id: null,
+    machine_id: CFG.currentMachineId || null,
     material: 'plywood',
+    tool_id: null,
     tool_diameter: parseFloat(CFG.defaultTool) || 0.157,
     tool_diameter_text: CFG.defaultToolText || '4mm',  // user's raw input, shown verbatim (e.g. "4mm")
     thickness: 0.25,
@@ -311,7 +312,9 @@
       chips.push(msel && msel.options[msel.selectedIndex] ? msel.options[msel.selectedIndex].text : state.material);
       chips.push(state.mode === '2.5d' ? '2.5D · thickness from CAD' : (state.thickness_text + ' thick'));
     }
-    chips.push('⌀ ' + state.tool_diameter_text + ' tool');
+    var toolSelect = $('#f-tool-select');
+    chips.push(state.tool_id && toolSelect && toolSelect.selectedOptions.length ?
+      toolSelect.selectedOptions[0].text : ('⌀ ' + state.tool_diameter_text + ' tool'));
     if (state.mode === 'tubing') {
       chips.push(state.parts.length + ' face' + (state.parts.length === 1 ? '' : 's'));
     } else {
@@ -407,6 +410,7 @@
   }
 
   function canLeave(name) {
+    if (name === 'setup' && !setupToolValid(true)) return false;
     if (name === 'parts' && state.parts.length === 0) {
       alert('Add at least one part before continuing.');
       return false;
@@ -452,6 +456,7 @@
     bindLengthField($('#f-tool'),
       function () { return state.tool_diameter_text; },
       function (inches, text) { state.tool_diameter = inches; state.tool_diameter_text = text; });
+    $('#f-tool-select').addEventListener('change', function () { selectTool(this.value); });
     bindLengthField($('#f-thickness'),
       function () { return state.thickness_text; },
       function (inches, text) { state.thickness = inches; state.thickness_text = text; });
@@ -462,6 +467,7 @@
     $('#f-square-end').addEventListener('change', function () { state.squareEnd = this.checked; });
     $('#f-cut-to-length').addEventListener('change', function () { state.cutToLength = this.checked; });
     applyModeUI();
+    selectMachine(state.machine_id || Object.keys(CFG.machines || {})[0]);
   }
 
   // Switch the active machine: pull its bed size, name, tool default, and material list
@@ -474,11 +480,11 @@
     var info = (CFG.machines || {})[mid];
     if (info) {
       state.machine = { width: info.x_max || state.machine.width, height: info.y_max || state.machine.height, name: info.name || mid };
-      rebuildMaterialOptions(info.materials);
+      rebuildToolOptions(info);
       // Follow the new machine's default tool ONLY if the field still holds the previous
       // machine's default (i.e. the user hasn't typed a custom value) — never clobber input.
       var toolInput = $('#f-tool');
-      if (toolInput && info.tool_text && oldInfo && state.tool_diameter_text === oldInfo.tool_text) {
+      if (!info.tools.length && toolInput && info.tool_text && oldInfo && state.tool_diameter_text === oldInfo.tool_text) {
         toolInput.value = info.tool_text;
         state.tool_diameter_text = info.tool_text;
         state.tool_diameter = info.tool || parseLength(info.tool_text) || state.tool_diameter;
@@ -494,12 +500,76 @@
     dbg('machine', mid);
   }
 
+  function currentTool() {
+    var info = (CFG.machines || {})[state.machine_id] || {};
+    return (info.tools || []).filter(function (t) { return t.id === state.tool_id; })[0] || null;
+  }
+
+  function setupToolValid(showAlert) {
+    var info = (CFG.machines || {})[state.machine_id] || {};
+    var tool = currentTool();
+    var reason = '';
+    if (info.tools && info.tools.length) {
+      if (!tool) reason = 'Select an available cutter.';
+      else if ((tool.materials || []).indexOf(state.material) < 0)
+        reason = 'The selected cutter is not approved for this material.';
+    } else if (!state.tool_diameter || state.tool_diameter <= 0) reason = 'Enter a valid tool diameter.';
+    if (reason && showAlert) alert(reason);
+    return !reason;
+  }
+
+  function rebuildToolOptions(info) {
+    var tools = info.tools || [];
+    var select = $('#f-tool-select');
+    $('#tool-select-field').hidden = !tools.length;
+    $('#tool-manual-field').hidden = !!tools.length;
+    select.innerHTML = '';
+    if (!tools.length) {
+      state.tool_id = null;
+      $('#tool-availability').hidden = true;
+      rebuildMaterialOptions(info.materials);
+      return;
+    }
+    tools.forEach(function (t) {
+      var opt = document.createElement('option');
+      opt.value = t.id;
+      opt.textContent = t.label;
+      opt.disabled = state.mode === 'tubing' && (t.materials || []).indexOf('aluminum_tube') < 0;
+      select.appendChild(opt);
+    });
+    var previous = state.tool_id;
+    var compatible = function (t) { return state.mode !== 'tubing' || (t.materials || []).indexOf('aluminum_tube') >= 0; };
+    var preferred = tools.some(function (t) { return t.id === previous && compatible(t); }) ? previous : info.default_tool_id;
+    var choice = tools.filter(function (t) { return t.id === preferred && compatible(t); })[0] ||
+      tools.filter(compatible)[0];
+    select.value = choice ? choice.id : '';
+    selectTool(select.value);
+  }
+
+  function selectTool(toolId) {
+    state.tool_id = toolId || null;
+    var tool = currentTool();
+    if (tool) {
+      state.tool_diameter = tool.diameter;
+      state.tool_diameter_text = tool.diameter + '"';
+    }
+    var note = $('#tool-availability');
+    var info = (CFG.machines || {})[state.machine_id] || {};
+    note.hidden = !!tool;
+    note.textContent = tool ? '' : 'No cutter is approved for this machining mode.';
+    rebuildMaterialOptions(info.materials);
+    updateSummary();
+  }
+
   // Rebuild the Material <select> for the selected machine, keeping the current material
   // if it still exists (else preferring plywood, then the first available).
   function rebuildMaterialOptions(materials) {
     var sel = $('#f-material');
-    if (!sel || !materials || !materials.length) return;
+    if (!sel || !materials) return;
     var prev = state.material;
+    var tool = currentTool();
+    if (tool) materials = materials.filter(function (m) { return (tool.materials || []).indexOf(m.id) >= 0; });
+    else if ((((CFG.machines || {})[state.machine_id] || {}).tools || []).length) materials = [];
     sel.innerHTML = '';
     var ids = [];
     materials.forEach(function (m) {
@@ -508,9 +578,9 @@
       sel.appendChild(opt);
       ids.push(m.id);
     });
-    var pick = ids.indexOf(prev) >= 0 ? prev : (ids.indexOf('plywood') >= 0 ? 'plywood' : ids[0]);
+    var pick = ids.indexOf(prev) >= 0 ? prev : (ids.indexOf('acetal') >= 0 ? 'acetal' : ids[0]);
     sel.value = pick;
-    if (state.mode !== 'tubing') state.material = pick;
+    if (state.mode !== 'tubing') state.material = pick || '';
   }
 
   // Reshape the Setup form for the selected mode. Tubing forces the aluminum-tube
@@ -528,6 +598,8 @@
     } else {
       var msel = $('#f-material'); if (msel) state.material = msel.value;
     }
+    var machineInfo = (CFG.machines || {})[state.machine_id];
+    if (machineInfo) rebuildToolOptions(machineInfo);
     var tf = $('#tube-fields'); if (tf) tf.hidden = !isTube;
     renderStepbar();
     updatePartsModeNote();
@@ -1257,6 +1329,7 @@
 
   function generate() {
     $('#preview-errors').textContent = '';
+    if (!setupToolValid(false)) { $('#preview-errors').textContent = 'Select a cutter approved for this material.'; return; }
     $('#gen-status').textContent = 'Generating…';
 
     if (state.mode === 'tubing') { generateTube(); }
@@ -1289,6 +1362,7 @@
     fd.append('material', 'aluminum_tube');
     if (state.machine_id) fd.append('machine_id', state.machine_id);
     fd.append('tool_diameter', state.tool_diameter);
+    if (state.tool_id) fd.append('tool_id', state.tool_id);
     fd.append('thickness', state.thickness);       // tube wall thickness
     // Both faces share one orientation on the jig; the backend applies this single
     // rotation to every face. Tube rotation is hard-snapped to 90 deg in the Layout step.
@@ -1325,7 +1399,7 @@
     // so placements are normalized relative to it.
     var bb = combinedBBox() || { minX: 0, minY: 0, w: 0, h: 0 };
     var job = {
-      material: state.material, tool_diameter: state.tool_diameter, machine_id: state.machine_id,
+      material: state.material, tool_diameter: state.tool_diameter, tool_id: state.tool_id, machine_id: state.machine_id,
       thickness: state.thickness, tab_spacing: state.tab_spacing,
       stock: { width: bb.w, height: bb.h },
       name: jobFilename(), parts: [],
@@ -1361,6 +1435,7 @@
     fd.append('material', state.material);
     if (state.machine_id) fd.append('machine_id', state.machine_id);
     fd.append('tool_diameter', state.tool_diameter);
+    if (state.tool_id) fd.append('tool_id', state.tool_id);
     fd.append('thickness', state.thickness);
     fd.append('origin_corner', 'bottom-left');
     fd.append('rotation', Math.round(p.rotation) % 360);

@@ -49,7 +49,7 @@ class TestProcessJobRoute(unittest.TestCase):
         with self.client.session_transaction() as sess:
             sess['app_verified'] = True
 
-    def _post_job(self, parts, stock=None, files=None):
+    def _post_job(self, parts, stock=None, files=None, job_overrides=None):
         stock = stock or {'width': 24, 'height': 24}
         job = {
             'material': 'plywood',
@@ -60,6 +60,7 @@ class TestProcessJobRoute(unittest.TestCase):
             'name': 'testjob',
             'parts': parts,
         }
+        job.update(job_overrides or {})
         data = {'job': json.dumps(job), 'timestamp': '2026-06-30 12:00:00'}
         for key, content in (files or {}).items():
             data[key] = (io.BytesIO(content), f'{key}.dxf')
@@ -95,6 +96,7 @@ class TestProcessJobRoute(unittest.TestCase):
                 parts=[{'file_index': 0, 'name': 'plate', 'place_x': 0,
                         'place_y': 0, 'rotation': 0}],
                 files={'file_0': part},
+                job_overrides={'tool_id': 'amana_51411', 'tool_diameter': 0.125},
             )
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         gcode = resp.get_json()['gcode']

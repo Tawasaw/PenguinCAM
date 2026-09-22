@@ -38,9 +38,13 @@ machines:
       tube_jig_work_offset: "G55"
       coolant: "None"
 
-    # Tool inventory is retained in the team configuration for setup checks and
-    # operator handoff. PenguinCAM currently consumes only default_tool.diameter;
-    # named-tool selection is not yet implemented in the GUI.
+    # Named cutters drive the picker and the server-side material checks.
+    # Operators confirm that the matching cutter and collet are physically installed.
+    # Amana's uncoated cutter families (do not confuse ACM with solid aluminum):
+    # https://www.amanatool.com/pub/media/productattachments/Plastic-O-Flute-Speed-Chart-v6.pdf
+    # https://www.amanatool.com/pub/media/productattachments/Aluminum-O-Flute-Speed-Chart-v6.pdf
+    # The plastic-family allowlist is conservative for this shop's available materials.
+    # Reconfirm polycarbonate feeds separately; Amana advises slower feeds for Lexan.
     tool_inventory:
       amana_51404:
         name: "Amana Tool 51404"
@@ -54,6 +58,7 @@ machines:
         flutes: 1
         flute_geometry: "O-flute"
         cut_direction: "upcut"
+        supported_materials: [acetal, polycarbonate, plywood]
 
       amana_51411:
         name: "Amana Tool 51411"
@@ -67,6 +72,7 @@ machines:
         flutes: 1
         flute_geometry: "O-flute"
         cut_direction: "upcut"
+        supported_materials: [acetal, polycarbonate, plywood]
 
       amana_51454:
         name: "Amana Tool 51454"
@@ -79,10 +85,11 @@ machines:
         flutes: 1
         flute_geometry: "O-flute"
         cut_direction: "upcut"
+        supported_materials: [aluminum, aluminum_tube]
 
       amana_51459:
         name: "Amana Tool 51459"
-        description: "Single O-flute upcut cutter; requires a dedicated 1/8 in ER11 collet"
+        description: "Single O-flute upcut cutter with 1/8 in shank"
         manufacturer: "Amana Tool"
         part_number: "51459"
         diameter: 0.125
@@ -92,6 +99,7 @@ machines:
         flutes: 1
         flute_geometry: "O-flute"
         cut_direction: "upcut"
+        supported_materials: [aluminum, aluminum_tube]
 
     default_tool:
       inventory_id: "amana_51411"

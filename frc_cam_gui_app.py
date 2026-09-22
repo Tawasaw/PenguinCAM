@@ -71,7 +71,7 @@ from frc_cam_postprocessor import (
 )
 
 # Import team config management
-from team_config import TeamConfig, DEFAULT_TOOL_DIAMETER_IN
+from team_config import TeamConfig, DEFAULT_TOOL_DIAMETER_IN, parse_length
 from config_validation import validate_and_sanitize_config, ConfigValidationError
 
 # ============================================================================
@@ -542,6 +542,37 @@ def _active_team_config(machine_id=None):
     return config.for_machine(machine_id or session.get('machine_id'))
 
 
+def _resolve_job_tool(config, tool_id, material, submitted_diameter=None):
+    """Enforce the same cutter/material rules for both compute endpoints.
+
+    Never trust a browser-supplied diameter when the machine has a named inventory.
+    Legacy machines without one retain the manual-diameter workflow.
+    """
+    inventory = config.get_tool_inventory()
+    if not inventory:
+        diameter = parse_length(submitted_diameter)
+        if diameter is None:
+            diameter = DEFAULT_TOOL_DIAMETER_IN if submitted_diameter is None else None
+        if diameter is None or not (0 < diameter < 100):
+            raise ValueError('Enter a valid positive tool diameter.')
+        return diameter
+    tool = inventory.get(tool_id) if isinstance(tool_id, str) else None
+    if not isinstance(tool, dict):
+        raise ValueError('Select a cutter from the configured tool inventory.')
+    diameter = parse_length(tool.get('diameter'))
+    shank = parse_length(tool.get('shank_diameter'))
+    if diameter is None or shank is None or not (0 < diameter < 100 and 0 < shank < 100):
+        raise ValueError('Selected cutter has an invalid diameter or shank size in the configuration.')
+    supported = tool.get('supported_materials')
+    if not isinstance(supported, list) or material not in supported:
+        raise ValueError('Selected cutter is not approved for this material.')
+    if submitted_diameter is not None:
+        supplied = parse_length(submitted_diameter)
+        if supplied is None or not (abs(supplied - diameter) <= 0.0001):
+            raise ValueError('Submitted tool diameter does not match the selected cutter.')
+    return diameter
+
+
 def _app_template_context(force_defaults=False):
     """Build the shared template context (machines, materials, tool, bed size) used by
     both the legacy single-part page and the multi-part wizard.
@@ -600,12 +631,32 @@ def _app_template_context(force_defaults=False):
     for mid in machines.keys():
         md = team_config.to_dict(mid)
         mats = team_config.get_available_materials(mid)
+        machine_cfg = team_config.get_machine_config(mid)
+        tools = []
+        for tool_id, tool in team_config.get_tool_inventory(mid).items():
+            if not isinstance(tool, dict):
+                continue
+            diameter = parse_length(tool.get('diameter'))
+            shank = parse_length(tool.get('shank_diameter'))
+            if diameter is None or shank is None or diameter <= 0 or shank <= 0:
+                continue
+            tools.append({
+                'id': tool_id,
+                'label': f"{tool.get('manufacturer', '')} {tool.get('part_number', tool_id)} - "
+                         f"{diameter:g} in cutter / {shank:g} in shank / "
+                         f"{tool.get('flutes', '?')} flute",
+                'diameter': diameter,
+                'shank': shank,
+                'materials': tool.get('supported_materials', []),
+            })
         machines_info[mid] = {
             'name': md.get('machine_name') or mid,
             'x_max': md.get('machine_x_max'),
             'y_max': md.get('machine_y_max'),
             'tool': md.get('default_tool_diameter'),
             'tool_text': md.get('default_tool_diameter_text'),
+            'default_tool_id': machine_cfg.get('default_tool', {}).get('inventory_id'),
+            'tools': tools,
             'materials': [
                 {'id': matid, 'name': m.get('name') or matid}
                 for matid, m in mats.items() if matid != 'aluminum_tube'
@@ -1012,12 +1063,16 @@ def process_file():
             return jsonify({'error': 'File must be a DXF file'}), 400
         
         # Get parameters
-        material = request.form.get('material', 'plywood')
-        is_aluminum_tube = (material.lower() == 'aluminum_tube')
+        requested_material = request.form.get('material', 'plywood')
+        is_aluminum_tube = (requested_material.lower() == 'aluminum_tube')
         machine_id = request.form.get('machine_id', None)  # Optional machine selection
-        material = normalize_material(material)  # aluminum_tube->aluminum, polycarb->polycarbonate
+        material = normalize_material(requested_material)  # aluminum_tube->aluminum, polycarb->polycarbonate
 
-        tool_diameter = float(request.form.get('tool_diameter', DEFAULT_TOOL_DIAMETER_IN))
+        team_config = _active_team_config(machine_id)
+        tool_diameter = _resolve_job_tool(
+            team_config, request.form.get('tool_id'),
+            'aluminum_tube' if is_aluminum_tube else material,
+            request.form.get('tool_diameter'))
         origin_corner = request.form.get('origin_corner', 'bottom-left')
         rotation = int(request.form.get('rotation', 0))
         mirror = request.form.get('mirror', '0') == '1'  # "flip over" (horizontal mirror)
@@ -1064,7 +1119,6 @@ def process_file():
 
         # Get the team config that applies to this request (upload-supplied, Onshape, or
         # defaults), bound to the selected machine so its full settings apply.
-        team_config = _active_team_config(machine_id)
         log(f"📋 Using team config: {team_config}")
         log(f"🔍 DEBUG: TeamConfig internals: team={team_config.team_number}, name={team_config.team_name}")
 
@@ -1279,11 +1333,14 @@ def process_job():
             return jsonify({'error': 'Job has no parts'}), 400
 
         # Shared job parameters (one tool/material per job in v1).
-        material = normalize_material(job.get('material', 'plywood'))  # aluminum_tube->aluminum, polycarb->polycarbonate
-        tool_diameter = float(job.get('tool_diameter', DEFAULT_TOOL_DIAMETER_IN))
+        requested_material = job.get('material', 'plywood')
+        material = normalize_material(requested_material)  # aluminum_tube->aluminum, polycarb->polycarbonate
         thickness = float(job.get('thickness', 0.25))
         tab_spacing = float(job.get('tab_spacing', 6.0))
         machine_id = job.get('machine_id')
+        team_config = _active_team_config(machine_id)
+        tool_diameter = _resolve_job_tool(team_config, job.get('tool_id'), material,
+                                          job.get('tool_diameter'))
         timestamp_str = request.form.get('timestamp', '')
 
         # Stock size (and G54 origin) are derived server-side from the placed parts'
@@ -1307,7 +1364,6 @@ def process_job():
             f.save(p)
             saved_paths[idx] = p
 
-        team_config = _active_team_config(machine_id)
         user_name = session.get('user_name')
         machine_x = team_config.machine_x_max
         machine_y = team_config.machine_y_max

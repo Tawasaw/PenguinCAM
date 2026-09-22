@@ -22,7 +22,7 @@ import math
 
 import yaml
 
-from team_config import LENGTH_KEYS, parse_length
+from team_config import LENGTH_KEYS, TEAM_6238_DEFAULTS, parse_length
 
 
 # Generous ceiling: a real config is a few KB. Anything larger is abuse or a YAML bomb.
@@ -228,5 +228,41 @@ def validate_and_sanitize_config(yaml_text, strict=True):
                 warnings.append(f"'default_machine' refers to an undefined machine "
                                 f"'{default_machine}'; using '{first}' instead.")
             data['default_machine'] = first
+
+    # A named inventory replaces free-form tool entry, so it must be complete and
+    # internally consistent. Reject the whole bad config in lenient mode too: falling
+    # back to a manual field for a malformed safety allowlist would be misleading.
+    machine_items = (data['machines'].items() if version == 2 else [('default', data)])
+    for machine_id, machine_data in machine_items:
+        if not isinstance(machine_data, dict):
+            return _fail(f"Machine '{machine_id}' must contain settings.")
+        inventory = machine_data.get('tool_inventory')
+        if inventory is None:
+            continue
+        if not isinstance(inventory, dict):
+            return _fail(f"Tool inventory for '{machine_id}' must be a mapping.")
+        machine_materials = machine_data.get('materials') or {}
+        if not isinstance(machine_materials, dict):
+            return _fail(f"Machine '{machine_id}' has invalid material settings.")
+        material_ids = set(TEAM_6238_DEFAULTS['materials']) | set(
+            machine_materials) | {'aluminum_tube'}
+        for tool_id, tool in inventory.items():
+            if not isinstance(tool, dict):
+                return _fail(f"Tool '{tool_id}' must contain settings.")
+            for dimension in ('diameter', 'shank_diameter'):
+                size = parse_length(tool.get(dimension))
+                if size is None or not math.isfinite(size) or not (0 < size < 100):
+                    return _fail(f"Tool '{tool_id}' needs a valid positive {dimension}.")
+            supported = tool.get('supported_materials')
+            if not isinstance(supported, list) or not supported or any(
+                not isinstance(material, str) or material not in material_ids
+                for material in supported):
+                return _fail(f"Tool '{tool_id}' needs a supported_materials list of defined material IDs.")
+        default_tool = machine_data.get('default_tool') or {}
+        if not isinstance(default_tool, dict):
+            return _fail(f"Machine '{machine_id}' has invalid default_tool settings.")
+        default_id = default_tool.get('inventory_id')
+        if default_id and default_id not in inventory:
+            return _fail(f"Default tool '{default_id}' is not in the inventory for '{machine_id}'.")
 
     return data, warnings

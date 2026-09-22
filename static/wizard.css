@@ -148,6 +148,7 @@ html, body {
 }
 
 .field { display: block; margin: 0 0 14px; }
+.field[hidden], .hint[hidden] { display: none; }
 .field > span, .field > legend { display: block; color: var(--muted); margin-bottom: 4px; font-size: 12px; }
 .field.inline { display: flex; align-items: center; gap: 8px; }
 .field.inline > span { margin: 0; }

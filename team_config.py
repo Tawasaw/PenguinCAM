@@ -471,6 +471,11 @@ class TeamConfig:
         machines = self._data.get('machines', {})
         return machines.get(machine_id, machines.get(self.default_machine_id, {}))
 
+    def get_tool_inventory(self, machine_id: Optional[str] = None) -> Dict[str, Any]:
+        """Named cutters for this machine; an absent inventory keeps legacy manual entry."""
+        inventory = self.get_machine_config(machine_id).get('tool_inventory', {})
+        return inventory if isinstance(inventory, dict) else {}
+
     # ========================================================================
     # Team Information
     # ========================================================================

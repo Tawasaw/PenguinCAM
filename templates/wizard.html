@@ -96,7 +96,13 @@
                     <label class="radio"><input type="radio" name="mode" value="tubing"> Tubing — machine both faces of a tube</label>
                 </fieldset>
 
-                <label class="field">
+                <label class="field" id="tool-select-field" hidden>
+                    <span>Cutter</span>
+                    <select id="f-tool-select"></select>
+                </label>
+                <p class="hint" id="tool-availability" hidden></p>
+
+                <label class="field" id="tool-manual-field">
                     <span>Tool diameter (in or mm)</span>
                     <input type="text" id="f-tool" inputmode="text" autocomplete="off" spellcheck="false"
                            placeholder='e.g. 0.157" or 4mm' value="{{ default_tool_diameter_text }}">
@@ -273,6 +279,7 @@
         bed: { width: {{ machine_x_max|tojson }}, height: {{ machine_y_max|tojson }} },
         machineName: {{ ((machines.get(current_machine_id) or {}).get('name') or 'Machine')|tojson }},
         machines: {{ (machines_info if machines_info is defined else {})|tojson }},
+        currentMachineId: {{ current_machine_id|tojson }},
         defaultTool: {{ default_tool_diameter|tojson }},
         defaultToolText: {{ (default_tool_diameter_text if default_tool_diameter_text is defined else '4mm')|tojson }},
         driveEnabled: {{ (drive_enabled if drive_enabled is defined else False)|tojson }},
