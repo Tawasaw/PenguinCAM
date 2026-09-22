@@ -143,6 +143,37 @@ class TestControllerPortability(unittest.TestCase):
         self.assertIn('G53 G0 X1.0 Y2.0', g)             # park appears only when configured
         self.assertIn('G53 G0 Z-0.5000', g)
 
+    def test_configured_startup_traverses_xy_before_descending_to_work_clearance(self):
+        g = self._flat_gcode(self._cfg(park_position={'x': 1.0, 'y': 2.0, 'z': -0.5}))
+        lines = g.splitlines()
+        machine_z = next(i for i, line in enumerate(lines) if 'Startup: raise to safe machine Z' in line)
+        origin_xy = next(i for i, line in enumerate(lines) if 'Rapid to work origin' in line)
+        work_z = next(i for i, line in enumerate(lines[origin_xy + 1:], origin_xy + 1)
+                      if 'Safe Z clearance' in line)
+        self.assertLess(machine_z, origin_xy)
+        self.assertLess(origin_xy, work_z)
+
+    def test_configured_restart_traverses_xy_before_descending(self):
+        cfg = TeamConfig({
+            'version': 2,
+            'default_machine': 'm',
+            'machines': {'m': {
+                'machine': {'park_position': {'x': 1.0, 'y': 2.0, 'z': -0.5}},
+                'machining': {'fixturing': {'pause_before_perimeter': True}},
+            }},
+        })
+        g = self._flat_gcode(cfg)
+        lines = g.splitlines()
+        restart = next(i for i, line in enumerate(lines) if 'RESTART AFTER PAUSE' in line)
+        machine_z = next(i for i, line in enumerate(lines[restart + 1:], restart + 1)
+                         if 'Restart: raise to safe machine Z' in line)
+        perimeter_xy = next(i for i, line in enumerate(lines[machine_z + 1:], machine_z + 1)
+                            if 'Move to perimeter start' in line)
+        work_z = next(i for i, line in enumerate(lines[perimeter_xy + 1:], perimeter_xy + 1)
+                      if 'Rapid down to clearance plane' in line)
+        self.assertLess(machine_z, perimeter_xy)
+        self.assertLess(perimeter_xy, work_z)
+
 
 class TestFirstPlungeClearanceRapid(unittest.TestCase):
     """At job start the tool sits up at safe_height (which can be several inches, well
@@ -3020,6 +3051,31 @@ class TestMultiPartEngine(unittest.TestCase):
         self.assertIn('PART 2: B', perim_block)
         tab_block = "\n".join(lines[i_tabs:])
         self.assertEqual(tab_block.count('TAB REMOVAL PASS'), 2)
+
+    def test_job_restart_keeps_machine_safe_z_until_first_perimeter_xy(self):
+        """The shared post-fixturing restart must not descend before the first perimeter."""
+        p1 = self._tabbed_part_with_hole(4.0, (0.0, 0.0))
+        p2 = self._tabbed_part_with_hole(4.0, (6.0, 0.0))
+        p1.park_position = (0.5, 0.5, -0.5)
+        p2.park_position = (0.5, 0.5, -0.5)
+        part_jobs = [self._phase_job(p1, 'A', 0.0, 0.0), self._phase_job(p2, 'B', 6.0, 0.0)]
+        g = assemble_job_gcode(part_jobs, header_pp=p1, timestamp='2026-06-30 12:00:00').gcode
+        lines = g.splitlines()
+
+        restart = next(i for i, line in enumerate(lines) if 'RESTART AFTER PAUSE' in line)
+        machine_z = next(i for i, line in enumerate(lines[restart + 1:], restart + 1)
+                         if 'Restart: raise to safe machine Z' in line)
+        perimeter_phase = next(i for i, line in enumerate(lines[machine_z + 1:], machine_z + 1)
+                               if 'PHASE: PERIMETERS' in line)
+        perimeter_xy = next(i for i, line in enumerate(lines[perimeter_phase + 1:], perimeter_phase + 1)
+                            if 'Move to perimeter start' in line)
+        work_z = next(i for i, line in enumerate(lines[perimeter_xy + 1:], perimeter_xy + 1)
+                      if 'Rapid down to clearance plane' in line)
+
+        self.assertFalse(any('Safe Z between parts' in line
+                             for line in lines[perimeter_phase:perimeter_xy]))
+        self.assertLess(machine_z, perimeter_xy)
+        self.assertLess(perimeter_xy, work_z)
 
     def test_job_no_pause_when_not_configured(self):
         """With pause_before_perimeter off, no refixturing pause is emitted even though

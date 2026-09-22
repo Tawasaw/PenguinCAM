@@ -477,6 +477,10 @@ class FRCPostProcessor:
         if coolant_on:
             gcode.append(coolant_on)
         gcode.append('G4 P3.0  ; 3 second spindle spin-up')
+        # Reassert the known machine-safe Z before the next XY positioning move. The
+        # following feature performs XY while fully raised, then _approach_ramp_start
+        # lowers to the normal work-clearance and ramp-start heights.
+        gcode.extend(self._machine_safe_z_gcode('Restart'))
         gcode.append('')
         # Tool resumes at safe height after the pause; the next feature must rapid down to
         # the clearance plane before its slow plunge feed (see _approach_ramp_start).
@@ -1704,6 +1708,18 @@ class FRCPostProcessor:
             f'G53 G0 X{px} Y{py}  ; {comment}: move gantry to park position',
         ]
 
+    def _machine_safe_z_gcode(self, comment: str) -> List[str]:
+        """Raise to configured machine-safe Z without changing XY.
+
+        This remains opt-in through ``park_position``. Portable profiles with no known
+        machine-coordinate convention continue to use work-coordinate clearance only.
+        """
+        if not self.park_position:
+            return []
+        return [
+            f'G53 G0 Z{self.park_position[2]:.4f}  ; {comment}: raise to safe machine Z'
+        ]
+
     def _tube_wcs_activate_gcode(self) -> str:
         """The work-coordinate-system line that opens a tube program. Default G54 (the
         operator zeros it to the tube for this job); an alternate fixed WCS (e.g. G55) is
@@ -1883,11 +1899,17 @@ class FRCPostProcessor:
         gcode.append("G54  ; " + ("Work coordinate system" if is_multilayer else "Use work coordinate system 1"))
         gcode.append("")
 
-        # Initial positioning: retract to a safe height in WORK coordinates (G54) so this
-        # is portable across controllers - no G53 machine move (which assumes machine Z=0
-        # is a safe high position, an assumption that breaks on GRBL/Easel/WinCNC).
-        gcode.append(f"G0 Z{self._safe_z():.4f}  ; Safe Z clearance")
-        gcode.append("G0 X0 Y0  ; " + ("Origin" if is_multilayer else "Rapid to work origin"))
+        # A profile with a proven machine-coordinate park Z can keep the cutter fully
+        # raised for the initial XY traverse and descend only after reaching the origin.
+        # Profiles without park_position retain the portable G54-only sequence.
+        machine_raise = self._machine_safe_z_gcode('Startup')
+        if machine_raise:
+            gcode.extend(machine_raise)
+            gcode.append("G0 X0 Y0  ; " + ("Origin" if is_multilayer else "Rapid to work origin"))
+            gcode.append(f"G0 Z{self._safe_z():.4f}  ; Safe Z clearance")
+        else:
+            gcode.append(f"G0 Z{self._safe_z():.4f}  ; Safe Z clearance")
+            gcode.append("G0 X0 Y0  ; " + ("Origin" if is_multilayer else "Rapid to work origin"))
         gcode.append("")
 
         # Tool is parked at safe height; the first feature must rapid down to the
@@ -5665,7 +5687,7 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
         safe_name = str(name).replace('(', '[').replace(')', ']')
         return f"(--- PART {i}: {safe_name} @ X{px:.4f} Y{py:.4f} ROT {rot:g} deg ---)"
 
-    def _emit_phase(section_title, phase_key):
+    def _emit_phase(section_title, phase_key, preserve_machine_safe_for_first=False):
         """Append every part's body for one phase, each under its part label + safe Z.
         Returns True if any part contributed lines to this phase."""
         bodies = [(i, pj) for i, pj in enumerate(part_jobs, 1) if pj.get(phase_key)]
@@ -5673,10 +5695,17 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
             return False
         gcode.append("")
         gcode.append(f"(===== {section_title} =====)")
-        for i, pj in bodies:
+        for body_index, (i, pj) in enumerate(bodies):
             gcode.append("")
             gcode.append(_part_label(i, pj))
-            gcode.append(f"G0 Z{header_pp._safe_z():.4f}  ; Safe Z between parts")
+            # Immediately after a parked pause, the restart block has reasserted
+            # machine-safe Z. Preserve it for the first perimeter's XY positioning move;
+            # the part body then descends through _approach_ramp_start. Ordinary
+            # transitions retain their existing work-coordinate clearance behavior.
+            keep_high = (preserve_machine_safe_for_first and body_index == 0
+                         and header_pp.park_position)
+            if not keep_high:
+                gcode.append(f"G0 Z{header_pp._safe_z():.4f}  ; Safe Z between parts")
             gcode.extend(pj[phase_key])
         return True
 
@@ -5686,7 +5715,8 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
     # Phase B: one shared refixturing pause between interiors and perimeters, if
     # configured. Only meaningful when there are perimeters still to cut.
     has_perimeters = any(pj.get('perimeter') for pj in part_jobs)
-    if header_pp.pause_before_perimeter and has_perimeters:
+    paused_before_perimeter = header_pp.pause_before_perimeter and has_perimeters
+    if paused_before_perimeter:
         gcode.extend(header_pp._generate_pause_and_park_gcode(
             'PAUSE FOR FIXTURING',
             [
@@ -5697,7 +5727,8 @@ def assemble_job_gcode(part_jobs, header_pp, timestamp=None, suggested_filename=
         ))
 
     # Phase C: all parts' perimeters (tab removal deferred to phase D).
-    _emit_phase("PHASE: PERIMETERS", 'perimeter')
+    _emit_phase("PHASE: PERIMETERS", 'perimeter',
+                preserve_machine_safe_for_first=paused_before_perimeter)
 
     # Phase D: all parts' tab removals (only parts whose perimeter left tabs).
     _emit_phase("PHASE: TAB REMOVAL", 'tab_removal')
