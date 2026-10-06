@@ -72,7 +72,7 @@ machines:
         flutes: 1
         flute_geometry: "O-flute"
         cut_direction: "upcut"
-        supported_materials: [acetal, polycarbonate, plywood]
+        supported_materials: [acetal, polycarbonate, plywood, hdpe_5865n112, swyft_srpp_3mm]
 
       amana_51454:
         name: "Amana Tool 51454"
@@ -137,6 +137,49 @@ machines:
       arc_radius: 0.030
 
     materials:
+      # Starter settings for Amana 51411 (1/8 in single O-flute), not a tested
+      # production recipe. Source sheets specify stock but no CNC feeds/speeds.
+      # Amana's plastic O-flute chart puts this cutter at 70-110 IPM / 18000 RPM
+      # at 1 x diameter depth. Use scrap tests; watch for melting and chip packing.
+      # stock_thickness is documentation only; enter measured thickness manually in the UI.
+      hdpe_5865n112:
+        name: "McMaster 5865N112 - HDPE sheet"
+        description: "Trial profile for 1/8 in extruded pipe-grade HDPE with Amana 51411; verify chip evacuation on scrap"
+        stock_thickness: '1/8"'
+        spindle_speed: 18000
+        feed_rate: 75.0
+        ramp_feed_rate: 35.0
+        plunge_rate: 10.0
+        traverse_rate: 90.0
+        approach_rate: 15.0
+        ramp_angle: 6.0
+        ramp_start_clearance: 0.060
+        stepover_percentage: 0.35
+        helix_radius_multiplier: 0.60
+        max_slotting_depth: 0.040
+        peck_drill_depth: 0.040
+        tab_width: 0.20
+        tab_height: 0.04
+
+      swyft_srpp_3mm:
+        name: "SWYFT Composite - 3 mm solid SRPP"
+        description: "EXPERIMENTAL trial profile for solid self-reinforced polypropylene with Amana 51411; inspect for tape pullout/delamination"
+        stock_thickness: "3mm"
+        spindle_speed: 18000
+        feed_rate: 75.0
+        ramp_feed_rate: 35.0
+        plunge_rate: 10.0
+        traverse_rate: 90.0
+        approach_rate: 15.0
+        ramp_angle: 6.0
+        ramp_start_clearance: 0.060
+        stepover_percentage: 0.35
+        helix_radius_multiplier: 0.60
+        max_slotting_depth: 0.030
+        peck_drill_depth: 0.030
+        tab_width: 0.20
+        tab_height: 0.04
+
       acetal:
         name: "Acetal - Delrin - POM"
         description: "Conservative 3 mm sheet profile for Amana 51411, 1/8 in single O-flute upcut"
